@@ -31,7 +31,7 @@ router.get('/dashboard/stats', authMiddleware, adminOnly, async (req, res) => {
 router.get('/users', authMiddleware, adminOnly, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, name, email, phone, role, is_verified, created_at FROM users ORDER BY created_at DESC'
+      'SELECT id, name, email, phone, role, is_verified, phone_verified, email_verified, created_at FROM users ORDER BY created_at DESC'
     );
     res.json({ users: result.rows });
   } catch (err) {
@@ -39,11 +39,23 @@ router.get('/users', authMiddleware, adminOnly, async (req, res) => {
   }
 });
 
-// DELETE /api/admin/users/:id
+// DELETE /api/admin/users/:id — anonymize so they can re-register with same email/phone
 router.delete('/users/:id', authMiddleware, adminOnly, async (req, res) => {
   try {
-    await pool.query('DELETE FROM users WHERE id=$1 AND role != $2', [req.params.id, 'admin']);
-    res.json({ message: 'User deleted' });
+    const userRes = await pool.query('SELECT role FROM users WHERE id=$1', [req.params.id]);
+    if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
+    if (userRes.rows[0].role === 'admin') return res.status(403).json({ error: 'Cannot delete admin' });
+    const ghost = `deleted_${req.params.id}_${Date.now()}`;
+    await pool.query(
+      `UPDATE users SET
+        name='[Deleted]', email=$1, phone=NULL,
+        password_hash='', is_verified=FALSE,
+        phone_verified=FALSE, email_verified=FALSE
+       WHERE id=$2`,
+      [`${ghost}@deleted.invalid`, req.params.id]
+    );
+    await pool.query('DELETE FROM otps WHERE email IN (SELECT email FROM users WHERE id=$1)', [req.params.id]);
+    res.json({ message: 'User cleared — they can re-register with the same email/phone' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -79,77 +91,128 @@ router.put('/orders/:id/status', authMiddleware, adminOnly, async (req, res) => 
 
 // POST /api/admin/orders/:id/refund
 const Stripe = require('stripe');
+const { sendRefundEmail } = require('../utils/email');
 router.post('/orders/:id/refund', authMiddleware, adminOnly, async (req, res) => {
-  const { refund_breakdown, cancelled_items } = req.body;
-  // cancelled_items: array of { productId, variantSize, qty, price } for partial cancellation
-  // if not provided, full order is cancelled
+  // cancel_type: 'refund' | 'no_refund' | 'coupon_cancel'
+  // cancelled_items: [{ productId, variantSize, cancelQty, price, name, color, size }]
+  // refund_breakdown: { items, shipping, tax, transaction_charge, total }
+  const { refund_breakdown, cancelled_items, cancel_type = 'refund' } = req.body;
   try {
-    const orderRes = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
+    const orderRes = await pool.query(
+      `SELECT o.*, u.email as user_email FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE o.id=$1`,
+      [req.params.id]
+    );
     const order = orderRes.rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.status === 'cancelled') return res.status(400).json({ error: 'Order is already cancelled' });
+    if (order.status === 'cancelled' && !cancelled_items?.length) return res.status(400).json({ error: 'Order is already cancelled' });
 
-    const refundAmount = parseFloat(refund_breakdown?.total) || 0;
-    if (refundAmount <= 0) return res.status(400).json({ error: 'Refund amount must be greater than 0' });
+    const isNoRefund = cancel_type === 'no_refund' || cancel_type === 'coupon_cancel';
+    const refundAmount = isNoRefund ? 0 : (parseFloat(refund_breakdown?.total) || 0);
+    const transactionCharge = parseFloat(refund_breakdown?.transaction_charge) || 0;
 
-    // Stripe refund
+    if (!isNoRefund && refundAmount <= 0) return res.status(400).json({ error: 'Refund amount must be greater than 0' });
+
+    // Stripe refund (only for refund type)
     let refundId = null;
-    if (order.stripe_payment_intent_id) {
-      const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-      const refund = await stripe.refunds.create({
-        payment_intent: order.stripe_payment_intent_id,
-        amount: Math.round(refundAmount * 100),
-      });
-      refundId = refund.id;
+    if (!isNoRefund) {
+      if (order.stripe_payment_intent_id) {
+        const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+        const refund = await stripe.refunds.create({
+          payment_intent: order.stripe_payment_intent_id,
+          amount: Math.round(refundAmount * 100),
+        });
+        refundId = refund.id;
+      } else {
+        refundId = `MANUAL-${Date.now()}`;
+      }
     } else {
-      refundId = `MANUAL-${Date.now()}`;
+      refundId = `NO-REFUND-${Date.now()}`;
     }
+
+    let currentItems = [];
+    try { currentItems = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || []); } catch(e) {}
 
     const isPartial = cancelled_items && cancelled_items.length > 0;
 
+    // Build history entry
+    let existingHistory = [];
+    try { existingHistory = typeof order.refund_history === 'string' ? JSON.parse(order.refund_history) : (order.refund_history || []); } catch(e) {}
+    const historyEntry = {
+      refund_id: refundId,
+      cancel_type,
+      amount: refundAmount,
+      transaction_charge: transactionCharge,
+      breakdown: refund_breakdown || {},
+      cancelled_items: cancelled_items || null,
+      timestamp: new Date().toISOString(),
+    };
+    const newHistory = [...existingHistory, historyEntry];
+
     if (isPartial) {
-      // Partial cancellation: remove cancelled items from order, keep rest active
-      let currentItems = [];
-      try { currentItems = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || []); } catch(e) {}
+      // Partial: reduce qty or remove items
+      const remainingItems = [];
+      const snapshotCancelled = [];
 
-      // Build a set of cancelled item keys
-      const cancelledKeys = new Set(cancelled_items.map(ci => `${ci.productId}__${ci.variantSize || ''}__${ci.qty}`));
-
-      const remainingItems = currentItems.filter(item => {
-        const key = `${item.product?.id}__${item.variant?.size || ''}__${item.qty}`;
-        return !cancelledKeys.has(key);
-      });
-
-      // Restore stock for cancelled items
-      for (const ci of cancelled_items) {
-        if (!ci.productId) continue;
-        const prodRes = await pool.query('SELECT variants FROM products WHERE id=$1', [ci.productId]);
-        let variants = [];
-        try { variants = typeof prodRes.rows[0]?.variants === 'string' ? JSON.parse(prodRes.rows[0].variants) : (prodRes.rows[0]?.variants || []); } catch(e) {}
-        for (let v of variants) {
-          for (let s of (v.sizes || [])) {
-            if (!ci.variantSize || s.size?.toString().trim() === ci.variantSize) {
-              s.stock = parseInt(s.stock || 0) + parseInt(ci.qty || 1);
+      for (const item of currentItems) {
+        const match = cancelled_items.find(ci =>
+          ci.productId === item.product?.id &&
+          (ci.variantSize || '') === (item.variant?.size || '')
+        );
+        if (match) {
+          const cancelQty = parseInt(match.cancelQty) || item.qty;
+          const leftQty = item.qty - cancelQty;
+          snapshotCancelled.push({ ...item, qty: cancelQty });
+          // Restore stock
+          if (item.product?.id) {
+            const prodRes = await pool.query('SELECT variants FROM products WHERE id=$1', [item.product.id]);
+            let variants = [];
+            try { variants = typeof prodRes.rows[0]?.variants === 'string' ? JSON.parse(prodRes.rows[0].variants) : (prodRes.rows[0]?.variants || []); } catch(e) {}
+            for (let v of variants) {
+              for (let s of (v.sizes || [])) {
+                if (!item.variant?.size || s.size?.toString().trim() === item.variant.size) {
+                  s.stock = parseInt(s.stock || 0) + cancelQty;
+                }
+              }
             }
+            if (variants.length) await pool.query('UPDATE products SET variants=$1 WHERE id=$2', [JSON.stringify(variants), item.product.id]);
           }
+          if (leftQty > 0) remainingItems.push({ ...item, qty: leftQty });
+        } else {
+          remainingItems.push(item);
         }
-        if (variants.length) await pool.query('UPDATE products SET variants=$1 WHERE id=$2', [JSON.stringify(variants), ci.productId]);
       }
+
+      // Merge with existing cancelled snapshot
+      let existingSnapshot = [];
+      try { existingSnapshot = typeof order.cancelled_items_snapshot === 'string' ? JSON.parse(order.cancelled_items_snapshot) : (order.cancelled_items_snapshot || []); } catch(e) {}
+      const fullSnapshot = [...existingSnapshot, ...snapshotCancelled];
 
       const newTotal = remainingItems.reduce((sum, item) => sum + (item.variant?.price || item.product?.price || 0) * item.qty, 0);
       const newStatus = remainingItems.length === 0 ? 'cancelled' : order.status;
+      const newCancelType = remainingItems.length === 0 ? cancel_type : (order.cancel_type || cancel_type);
 
       await pool.query(
-        `UPDATE orders SET items=$1, total=$2, status=$3, refund_id=$4, refund_amount=COALESCE(refund_amount,0)+$5, refund_breakdown=$6 WHERE id=$7`,
-        [JSON.stringify(remainingItems), newTotal, newStatus, refundId, refundAmount, JSON.stringify(refund_breakdown || {}), req.params.id]
+        `UPDATE orders SET items=$1, total=$2, status=$3, refund_id=$4,
+          refund_amount=COALESCE(refund_amount,0)+$5, refund_breakdown=$6,
+          cancelled_items_snapshot=$7, refund_history=$8, cancel_type=$9 WHERE id=$10`,
+        [JSON.stringify(remainingItems), newTotal, newStatus, refundId,
+          refundAmount, JSON.stringify(refund_breakdown || {}),
+          JSON.stringify(fullSnapshot), JSON.stringify(newHistory), newCancelType, req.params.id]
       );
 
-      return res.json({ success: true, refund_id: refundId, amount: refundAmount, partial: true, remaining_items: remainingItems.length });
+      await sendRefundEmail({
+        order: { ...order, user_email: order.user_email },
+        refundId, refundAmount, cancelType: cancel_type,
+        cancelledItems: cancelled_items, remainingItems, transactionCharge,
+      });
+
+      return res.json({
+        success: true, refund_id: refundId, amount: refundAmount,
+        partial: true, remaining_items: remainingItems.length,
+        cancelled_items_snapshot: fullSnapshot,
+      });
     } else {
       // Full cancellation
-      // Restore stock for all items
-      let currentItems = [];
-      try { currentItems = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || []); } catch(e) {}
       for (const item of currentItems) {
         if (!item.product?.id) continue;
         const prodRes = await pool.query('SELECT variants FROM products WHERE id=$1', [item.product.id]);
@@ -166,14 +229,257 @@ router.post('/orders/:id/refund', authMiddleware, adminOnly, async (req, res) =>
       }
 
       await pool.query(
-        `UPDATE orders SET status='cancelled', refund_id=$1, refund_amount=$2, refund_breakdown=$3 WHERE id=$4`,
-        [refundId, refundAmount, JSON.stringify(refund_breakdown || {}), req.params.id]
+        `UPDATE orders SET status='cancelled', refund_id=$1, refund_amount=$2, refund_breakdown=$3,
+          cancelled_items_snapshot=$4, refund_history=$5, cancel_type=$6 WHERE id=$7`,
+        [refundId, refundAmount, JSON.stringify(refund_breakdown || {}),
+          JSON.stringify(currentItems), JSON.stringify(newHistory), cancel_type, req.params.id]
       );
 
-      return res.json({ success: true, refund_id: refundId, amount: refundAmount, partial: false });
+      await sendRefundEmail({
+        order: { ...order, user_email: order.user_email },
+        refundId, refundAmount, cancelType: cancel_type,
+        cancelledItems: null, remainingItems: [], transactionCharge,
+      });
+
+      return res.json({ success: true, refund_id: refundId, amount: refundAmount, partial: false, cancel_type });
     }
   } catch (err) {
     console.error('Refund error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/orders/:id/mark-balance-paid
+// body: { method: 'cash' | 'upi' | 'stripe' | 'other', note }
+router.post('/orders/:id/mark-balance-paid', authMiddleware, adminOnly, async (req, res) => {
+  const { method = 'manual', note } = req.body;
+  try {
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
+    const order = orderRes.rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const balanceDue = parseFloat(order.balance_due) || 0;
+    if (balanceDue <= 0) return res.status(400).json({ error: 'No balance due on this order' });
+
+    let existingHistory = [];
+    try { existingHistory = typeof order.edit_history === 'string' ? JSON.parse(order.edit_history) : (order.edit_history || []); } catch(e) {}
+    const entry = {
+      timestamp: new Date().toISOString(),
+      note: note || `Balance of $${balanceDue.toFixed(2)} marked as paid (${method})`,
+      amount_paid: balanceDue,
+      method,
+    };
+
+    await pool.query(
+      `UPDATE orders SET balance_due=0, payment_link_url=NULL, edit_history=$1 WHERE id=$2`,
+      [JSON.stringify([...existingHistory, entry]), req.params.id]
+    );
+    res.json({ success: true, amount_paid: balanceDue });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/orders/:id/resend-payment-link
+// Regenerates a fresh Stripe payment link for the current balance_due
+router.post('/orders/:id/resend-payment-link', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
+    const order = orderRes.rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const balanceDue = parseFloat(order.balance_due) || 0;
+    if (balanceDue <= 0) return res.status(400).json({ error: 'No balance due on this order' });
+
+    const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+    const session = await stripe.paymentLinks.create({
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: { name: `Balance due for Order #${order.order_number || order.id}` },
+          unit_amount: Math.round(balanceDue * 100),
+        },
+        quantity: 1,
+      }],
+      after_completion: { type: 'redirect', redirect: { url: process.env.FRONTEND_URL || 'https://hourajewels.com' } },
+    });
+
+    await pool.query('UPDATE orders SET payment_link_url=$1 WHERE id=$2', [session.url, req.params.id]);
+    res.json({ success: true, payment_link_url: session.url });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/admin/orders/:id/edit
+// body: { items, address, customer_phone, note }
+// - items: full new items array (already-resolved product/variant objects)
+// - address: updated shipping address object
+// - customer_phone: update user phone
+// - note: reason for edit
+router.put('/orders/:id/edit', authMiddleware, adminOnly, async (req, res) => {
+  const { items: newItems, address, customer_phone, note } = req.body;
+  try {
+    const orderRes = await pool.query(
+      `SELECT o.*, u.email as user_email, u.id as uid FROM orders o LEFT JOIN users u ON o.user_id = u.id WHERE o.id=$1`,
+      [req.params.id]
+    );
+    const order = orderRes.rows[0];
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status === 'cancelled') return res.status(400).json({ error: 'Cannot edit a cancelled order' });
+
+    let oldItems = [];
+    try { oldItems = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || []); } catch(e) {}
+    let oldAddress = {};
+    try { oldAddress = typeof order.address === 'string' ? JSON.parse(order.address) : (order.address || {}); } catch(e) {}
+
+    const updatedItems = newItems || oldItems;
+    const updatedAddress = address ? { ...oldAddress, ...address } : oldAddress;
+
+    // Recalculate total from new items
+    const newItemsTotal = updatedItems.reduce((s, i) => s + (i.variant?.price || i.product?.price || 0) * (i.qty || 1), 0);
+    const shipping = parseFloat(order.shipping_fee) || 0;
+    const tax = parseFloat(order.tax_amount) || 0;
+    const discount = parseFloat(order.discount_amount) || 0;
+    const newTotal = Math.max(0, newItemsTotal + shipping + tax - discount);
+    const oldTotal = parseFloat(order.total) || 0;
+    const diff = parseFloat((newTotal - oldTotal).toFixed(2));
+
+    // Restore stock for removed/reduced items, deduct for added/increased
+    for (const oldItem of oldItems) {
+      if (!oldItem.product?.id) continue;
+      const match = updatedItems.find(ni =>
+        ni.product?.id === oldItem.product.id &&
+        (ni.variant?.size || '') === (oldItem.variant?.size || '')
+      );
+      const oldQty = oldItem.qty || 1;
+      const newQty = match ? (match.qty || 1) : 0;
+      const qtyDiff = oldQty - newQty; // positive = restore stock
+      if (qtyDiff === 0) continue;
+      const prodRes = await pool.query('SELECT variants FROM products WHERE id=$1', [oldItem.product.id]);
+      let variants = [];
+      try { variants = typeof prodRes.rows[0]?.variants === 'string' ? JSON.parse(prodRes.rows[0].variants) : (prodRes.rows[0]?.variants || []); } catch(e) {}
+      for (let v of variants) {
+        for (let s of (v.sizes || [])) {
+          if (!oldItem.variant?.size || s.size?.toString().trim() === oldItem.variant.size) {
+            s.stock = Math.max(0, parseInt(s.stock || 0) + qtyDiff);
+          }
+        }
+      }
+      if (variants.length) await pool.query('UPDATE products SET variants=$1 WHERE id=$2', [JSON.stringify(variants), oldItem.product.id]);
+    }
+    // Deduct stock for newly added items
+    for (const newItem of updatedItems) {
+      if (!newItem.product?.id) continue;
+      const wasInOld = oldItems.find(oi =>
+        oi.product?.id === newItem.product.id &&
+        (oi.variant?.size || '') === (newItem.variant?.size || '')
+      );
+      if (!wasInOld) {
+        const prodRes = await pool.query('SELECT variants FROM products WHERE id=$1', [newItem.product.id]);
+        let variants = [];
+        try { variants = typeof prodRes.rows[0]?.variants === 'string' ? JSON.parse(prodRes.rows[0].variants) : (prodRes.rows[0]?.variants || []); } catch(e) {}
+        for (let v of variants) {
+          for (let s of (v.sizes || [])) {
+            if (!newItem.variant?.size || s.size?.toString().trim() === newItem.variant.size) {
+              s.stock = Math.max(0, parseInt(s.stock || 0) - (newItem.qty || 1));
+            }
+          }
+        }
+        if (variants.length) await pool.query('UPDATE products SET variants=$1 WHERE id=$2', [JSON.stringify(variants), newItem.product.id]);
+      }
+    }
+
+    // Update customer phone if provided
+    if (customer_phone && order.uid) {
+      await pool.query('UPDATE users SET phone=$1 WHERE id=$2', [customer_phone, order.uid]);
+    }
+
+    // Build edit history entry
+    let existingHistory = [];
+    try { existingHistory = typeof order.edit_history === 'string' ? JSON.parse(order.edit_history) : (order.edit_history || []); } catch(e) {}
+    const historyEntry = {
+      timestamp: new Date().toISOString(),
+      note: note || 'Order edited by admin',
+      old_total: oldTotal,
+      new_total: newTotal,
+      diff,
+      old_items: oldItems,
+      new_items: updatedItems,
+      old_address: oldAddress,
+      new_address: updatedAddress,
+      old_phone: oldAddress.mobile,
+      new_phone: customer_phone || oldAddress.mobile,
+    };
+    const newHistory = [...existingHistory, historyEntry];
+
+    let paymentLinkUrl = null;
+    let balanceDue = 0;
+    let refundId = null;
+    let refundAmount = 0;
+
+    if (diff > 0) {
+      // Customer owes more — create Stripe payment link
+      balanceDue = diff;
+      const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+      const session = await stripe.paymentLinks.create({
+        line_items: [{
+          price_data: {
+            currency: 'usd',
+            product_data: { name: `Balance due for Order #${order.order_number || order.id}` },
+            unit_amount: Math.round(diff * 100),
+          },
+          quantity: 1,
+        }],
+        after_completion: { type: 'redirect', redirect: { url: process.env.FRONTEND_URL || 'https://hourajewels.com' } },
+      });
+      paymentLinkUrl = session.url;
+    } else if (diff < 0) {
+      // Refund the difference
+      refundAmount = Math.abs(diff);
+      if (order.stripe_payment_intent_id) {
+        const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+        const refund = await stripe.refunds.create({
+          payment_intent: order.stripe_payment_intent_id,
+          amount: Math.round(refundAmount * 100),
+        });
+        refundId = refund.id;
+      } else {
+        refundId = `MANUAL-EDIT-${Date.now()}`;
+      }
+    }
+
+    await pool.query(
+      `UPDATE orders SET
+        items=$1, address=$2, total=$3,
+        edit_history=$4,
+        balance_due=$5,
+        payment_link_url=$6,
+        refund_id=COALESCE($7, refund_id),
+        refund_amount=COALESCE(refund_amount,0)+$8
+       WHERE id=$9`,
+      [
+        JSON.stringify(updatedItems),
+        JSON.stringify(updatedAddress),
+        newTotal,
+        JSON.stringify(newHistory),
+        balanceDue,
+        paymentLinkUrl,
+        refundId,
+        refundAmount,
+        req.params.id,
+      ]
+    );
+
+    res.json({
+      success: true,
+      new_total: newTotal,
+      diff,
+      balance_due: balanceDue,
+      payment_link_url: paymentLinkUrl,
+      refund_id: refundId,
+      refund_amount: refundAmount,
+    });
+  } catch (err) {
+    console.error('Order edit error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -265,6 +571,16 @@ router.post('/orders/:id/shippo-rates', authMiddleware, adminOnly, async (req, r
     const orderRes = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
     const order = orderRes.rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    let items = [];
+    try { items = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || []); } catch(e) {}
+
+    let totalWeightOz = 0;
+    for (const item of items) {
+      const w = parseFloat(item.variant?.weight || item.size?.weight || 0);
+      totalWeightOz += (w > 0 ? w : 16) * (item.qty || 1);
+    }
+    if (totalWeightOz === 0) totalWeightOz = 16;
 
     let address = {};
     try { address = typeof order.address === 'string' ? JSON.parse(order.address) : (order.address || {}); } catch(e) {}
@@ -405,6 +721,28 @@ router.post('/products', authMiddleware, adminOnly, async (req, res) => {
     }
 
     try {
+      if (variants && variants.length > 0) {
+        const allProdsRes = await pool.query('SELECT id, variants FROM products');
+        const existingCodes = new Set();
+        for (const row of allProdsRes.rows) {
+          let v = [];
+          try { v = typeof row.variants === 'string' ? JSON.parse(row.variants) : (row.variants || []); } catch(e) {}
+          v.forEach(va => va.sizes?.forEach(s => { if (s.code) existingCodes.add(s.code.trim().toLowerCase()); }));
+        }
+        
+        for (const v of variants) {
+          for (const s of (v.sizes || [])) {
+            if (!s.code || !s.code.trim()) {
+              return res.status(400).json({ error: 'All variant sizes must have a valid product code.' });
+            }
+            if (existingCodes.has(s.code.trim().toLowerCase())) {
+              return res.status(400).json({ error: `Product code "${s.code}" already exists.` });
+            }
+            s.stock = parseInt(s.stock_delta || s.stock || 0); // initial setup
+            delete s.stock_delta;
+          }
+        }
+      }
     const result = await pool.query(
       `INSERT INTO products 
        (name, description, stock, sizes, image_url, images, color, category, model, is_active, is_bestseller, is_trending, is_offer, is_festive, variants, reviews, details, allow_reviews) 
@@ -432,6 +770,55 @@ router.post('/products', authMiddleware, adminOnly, async (req, res) => {
 router.put('/products/:id', authMiddleware, adminOnly, async (req, res) => {
   const { name, description, sizes, stock, image_url, images, color, category, model, is_active, is_bestseller, is_trending, is_offer, is_festive, variants, reviews, details, allow_reviews } = req.body;
   try {
+    if (variants && variants.length > 0) {
+      const allProdsRes = await pool.query('SELECT id, variants FROM products WHERE id != $1', [req.params.id]);
+      const existingCodes = new Set();
+      for (const row of allProdsRes.rows) {
+        let v = [];
+        try { v = typeof row.variants === 'string' ? JSON.parse(row.variants) : (row.variants || []); } catch(e) {}
+        v.forEach(va => va.sizes?.forEach(s => { if (s.code) existingCodes.add(s.code.trim().toLowerCase()); }));
+      }
+
+      // Fetch current product to process stock_delta
+      const currProdRes = await pool.query('SELECT variants FROM products WHERE id = $1', [req.params.id]);
+      let currVariants = [];
+      try { currVariants = typeof currProdRes.rows[0].variants === 'string' ? JSON.parse(currProdRes.rows[0].variants) : (currProdRes.rows[0].variants || []); } catch(e) {}
+      
+      for (const v of variants) {
+        for (const s of (v.sizes || [])) {
+          if (!s.code || !s.code.trim()) {
+            return res.status(400).json({ error: 'All variant sizes must have a valid product code.' });
+          }
+          if (existingCodes.has(s.code.trim().toLowerCase())) {
+            return res.status(400).json({ error: `Product code "${s.code}" already exists.` });
+          }
+          
+          // Apply stock_delta if provided
+          if (s.stock_delta !== undefined && s.stock_delta !== null && s.stock_delta !== '') {
+            let existingStock = 0;
+            // Find this size in existing variants to get its current stock
+            for (const cv of currVariants) {
+              const cs = (cv.sizes || []).find(x => x.code === s.code);
+              if (cs) {
+                existingStock = parseInt(cs.stock || 0);
+                break;
+              }
+            }
+            const delta = parseInt(s.stock_delta || 0);
+            const newStock = existingStock + delta;
+            if (newStock < 0) {
+              return res.status(400).json({ error: `Insufficient stock to reduce ${Math.abs(delta)} from "${s.code}". Currently only ${existingStock} available.` });
+            }
+            s.stock = newStock;
+            delete s.stock_delta; // clean up before saving
+          } else {
+            // New size added without delta, or no delta passed
+            s.stock = parseInt(s.stock || 0);
+          }
+        }
+      }
+    }
+
     const sizesJson = Array.isArray(sizes) ? JSON.stringify(sizes) : '[]';
     const imagesJson = Array.isArray(images) ? JSON.stringify(images) : (image_url ? JSON.stringify([image_url]) : '[]');
     const variantsJson = Array.isArray(variants) ? JSON.stringify(variants) : '[]';
@@ -499,13 +886,16 @@ router.get('/coupons', authMiddleware, adminOnly, async (req, res) => {
 });
 
 router.post('/coupons', authMiddleware, adminOnly, async (req, res) => {
-  const { code, discount_type, discount_value, min_order_value, is_active, expires_at, user_id, usage_type, min_type, min_qty } = req.body;
+  const { code, discount_type, discount_value, min_order_value, is_active, expires_at, user_id, usage_type, min_type, min_qty, applicable_categories, applicable_product_codes } = req.body;
   try {
-    const validExpiresAt = expires_at === '' ? null : expires_at;
-    const targetUserId = user_id && user_id !== 'all' ? user_id : null;
+    const finalUserId = user_id === 'all' ? null : user_id;
+    const finalExpires = expires_at ? new Date(expires_at) : null;
+    const finalCategories = JSON.stringify(applicable_categories || []);
+    const finalCodes = JSON.stringify(applicable_product_codes || []);
+    
     const result = await pool.query(
-      'INSERT INTO coupons (code, discount_type, discount_value, min_order_value, is_active, expires_at, user_id, usage_type, min_type, min_qty) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
-      [code, discount_type || 'percentage', discount_value || 0, min_order_value || 0, is_active ?? true, validExpiresAt, targetUserId, usage_type || 'multiple', min_type || 'amount', min_qty || 0]
+      'INSERT INTO coupons (code, discount_type, discount_value, min_order_value, is_active, expires_at, user_id, usage_type, min_type, min_qty, applicable_categories, applicable_product_codes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *',
+      [code, discount_type, discount_value, min_order_value || 0, is_active, finalExpires, finalUserId, usage_type || 'multiple', min_type || 'amount', min_qty || 0, finalCategories, finalCodes]
     );
     res.json({ coupon: result.rows[0] });
   } catch (err) {
@@ -514,13 +904,16 @@ router.post('/coupons', authMiddleware, adminOnly, async (req, res) => {
 });
 
 router.put('/coupons/:id', authMiddleware, adminOnly, async (req, res) => {
-  const { code, discount_type, discount_value, min_order_value, is_active, expires_at, user_id, usage_type, min_type, min_qty } = req.body;
+  const { code, discount_type, discount_value, min_order_value, is_active, expires_at, user_id, usage_type, min_type, min_qty, applicable_categories, applicable_product_codes } = req.body;
   try {
-    const validExpiresAt = expires_at === '' ? null : expires_at;
-    const targetUserId = user_id && user_id !== 'all' ? user_id : null;
+    const finalUserId = user_id === 'all' ? null : user_id;
+    const finalExpires = expires_at ? new Date(expires_at) : null;
+    const finalCategories = JSON.stringify(applicable_categories || []);
+    const finalCodes = JSON.stringify(applicable_product_codes || []);
+    
     const result = await pool.query(
-      'UPDATE coupons SET code=$1, discount_type=$2, discount_value=$3, min_order_value=$4, is_active=$5, expires_at=$6, user_id=$7, usage_type=$8, min_type=$9, min_qty=$10 WHERE id=$11 RETURNING *',
-      [code, discount_type || 'percentage', discount_value || 0, min_order_value || 0, is_active ?? true, validExpiresAt, targetUserId, usage_type || 'multiple', min_type || 'amount', min_qty || 0, req.params.id]
+      'UPDATE coupons SET code=$1, discount_type=$2, discount_value=$3, min_order_value=$4, is_active=$5, expires_at=$6, user_id=$7, usage_type=$8, min_type=$9, min_qty=$10, applicable_categories=$11, applicable_product_codes=$12 WHERE id=$13 RETURNING *',
+      [code, discount_type, discount_value, min_order_value || 0, is_active, finalExpires, finalUserId, usage_type || 'multiple', min_type || 'amount', min_qty || 0, finalCategories, finalCodes, req.params.id]
     );
     res.json({ coupon: result.rows[0] });
   } catch (err) {

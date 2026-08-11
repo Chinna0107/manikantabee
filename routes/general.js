@@ -75,15 +75,75 @@ router.post('/products/:id/reviews', async (req, res) => {
   }
 });
 
+// POST /api/general/check-stock
+router.post('/check-stock', async (req, res) => {
+  const { items } = req.body;
+  if (!items || items.length === 0) return res.status(400).json({ error: 'No items' });
+  try {
+    const unavailable = [];
+    for (const item of items) {
+      if (!item.product?.id) continue;
+      const prodRes = await pool.query('SELECT name, variants FROM products WHERE id=$1', [item.product.id]);
+      if (!prodRes.rows.length) { unavailable.push({ name: item.product.name || 'Unknown', reason: 'Product not found' }); continue; }
+      let variants = [];
+      try { variants = typeof prodRes.rows[0].variants === 'string' ? JSON.parse(prodRes.rows[0].variants) : (prodRes.rows[0].variants || []); } catch(e) {}
+      const itemColor = (item.variant?.color || item.product?.color || '').toString().toLowerCase().trim();
+      const itemSize = (item.variant?.size || '').toString().trim();
+      let found = false;
+      for (const v of variants) {
+        const vColor = (v.color || '').toString().toLowerCase().trim();
+        const colorMatch = !itemColor || !vColor || vColor === itemColor;
+        if (colorMatch) {
+          for (const s of (v.sizes || [])) {
+            if (!itemSize || s.size?.toString().trim() === itemSize) {
+              found = true;
+              if (parseInt(s.stock || 0) < parseInt(item.qty || 1)) {
+                unavailable.push({ name: prodRes.rows[0].name, available: parseInt(s.stock || 0), requested: item.qty });
+              }
+            }
+          }
+        }
+      }
+      if (!found) unavailable.push({ name: prodRes.rows[0].name, reason: 'Variant not found' });
+    }
+    res.json({ available: unavailable.length === 0, unavailable });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // POST /api/general/orders (Checkout)
 router.post('/orders', async (req, res) => {
-  const { items, address, total, coupon_code, payment_method, advance_paid, order_type, stripe_payment_intent_id } = req.body;
+  const { items, address, total, coupon_code, payment_method, advance_paid, order_type, stripe_payment_intent_id, discount_amount, shipping_fee, tax_amount } = req.body;
   
   if (!items || items.length === 0) {
     return res.status(400).json({ error: 'Cart is empty' });
   }
 
   try {
+    // Stock validation
+    for (const item of items) {
+      if (!item.product?.id) continue;
+      const prodRes = await pool.query('SELECT name, variants FROM products WHERE id=$1', [item.product.id]);
+      if (!prodRes.rows.length) return res.status(400).json({ error: `Product not found` });
+      let variants = [];
+      try { variants = typeof prodRes.rows[0].variants === 'string' ? JSON.parse(prodRes.rows[0].variants) : (prodRes.rows[0].variants || []); } catch(e) {}
+      const itemColor = (item.variant?.color || item.product?.color || '').toString().toLowerCase().trim();
+      const itemSize = (item.variant?.size || '').toString().trim();
+      for (const v of variants) {
+        const colorMatch = !itemColor || !v.color || v.color.toLowerCase().trim() === itemColor;
+        if (colorMatch) {
+          for (const s of (v.sizes || [])) {
+            if (!itemSize || s.size?.toString().trim() === itemSize) {
+              if (parseInt(s.stock || 0) < parseInt(item.qty || 1)) {
+                return res.status(400).json({ error: `"${prodRes.rows[0].name}" is out of stock or insufficient quantity available.`, outOfStock: true });
+              }
+            }
+          }
+        }
+      }
+    }
+
     const countRes = await pool.query(`SELECT COUNT(*) FROM orders`);
     const nextNum = parseInt(countRes.rows[0].count) + 1;
     const orderNumber = `HJ-${String(nextNum).padStart(6, '0')}`;
@@ -94,9 +154,9 @@ router.post('/orders', async (req, res) => {
     const oType = order_type === 'pickup' ? 'pickup' : 'shipping';
     
     const result = await pool.query(
-      `INSERT INTO orders (order_number, total, items, address, status, payment_method, advance_paid, order_type, stripe_payment_intent_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, stripe_payment_intent_id || null]
+      `INSERT INTO orders (order_number, total, items, address, status, payment_method, advance_paid, order_type, stripe_payment_intent_id, discount_amount, coupon_code, shipping_fee, tax_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+      [orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, stripe_payment_intent_id || null, discount_amount || 0, coupon_code || null, shipping_fee || 0, tax_amount || 0]
     );
     
     // Reduce Stock Logic
@@ -198,7 +258,7 @@ router.get('/banners', async (req, res) => {
 
 // POST /api/general/validate-coupon
 router.post('/validate-coupon', async (req, res) => {
-  const { code, cartValue, cartQty, user_id } = req.body;
+  const { code, cartValue, cartQty, user_id, cartItems } = req.body;
   try {
     const result = await pool.query('SELECT * FROM coupons WHERE code=$1 AND is_active=true', [code]);
     const coupon = result.rows[0];
@@ -222,14 +282,48 @@ router.post('/validate-coupon', async (req, res) => {
       }
     }
 
+    let checkQty = cartQty || 0;
+    let checkValue = cartValue || 0;
+
+    const hasCatTarget = coupon.applicable_categories && coupon.applicable_categories.length > 0;
+    const hasCodeTarget = coupon.applicable_product_codes && coupon.applicable_product_codes.length > 0;
+
+    if ((hasCatTarget || hasCodeTarget) && cartItems && Array.isArray(cartItems)) {
+      let eligibleQty = 0;
+      let eligibleValue = 0;
+
+      for (const item of cartItems) {
+        let isEligible = false;
+        if (hasCatTarget && coupon.applicable_categories.includes(item.category)) {
+          isEligible = true;
+        }
+        if (hasCodeTarget && coupon.applicable_product_codes.includes(item.code)) {
+          isEligible = true;
+        }
+        
+        if (isEligible) {
+          eligibleQty += (item.qty || 1);
+          const currentPrice = item.our_price && item.our_price > 0 ? item.our_price : item.mrp;
+          eligibleValue += (currentPrice * (item.qty || 1));
+        }
+      }
+
+      if (eligibleQty === 0) {
+        return res.status(400).json({ error: 'No items in your cart are eligible for this coupon' });
+      }
+
+      checkQty = eligibleQty;
+      checkValue = eligibleValue;
+    }
+
     // Min requirement check
     if (coupon.min_type === 'qty') {
-      if ((cartQty || 0) < (coupon.min_qty || 0)) {
-        return res.status(400).json({ error: `Minimum ${coupon.min_qty} item(s) required for this coupon` });
+      if (checkQty < (coupon.min_qty || 0)) {
+        return res.status(400).json({ error: `Minimum ${coupon.min_qty} eligible item(s) required` });
       }
     } else {
-      if ((cartValue || 0) < (coupon.min_order_value || 0)) {
-        return res.status(400).json({ error: `Minimum order value for this coupon is ₹${coupon.min_order_value}` });
+      if (checkValue < (coupon.min_order_value || 0)) {
+        return res.status(400).json({ error: `Minimum eligible order value is $${coupon.min_order_value}` });
       }
     }
 

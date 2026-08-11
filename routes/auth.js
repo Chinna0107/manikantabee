@@ -89,17 +89,17 @@ router.post('/signup', async (req, res) => {
       return res.status(409).json({ error: 'Phone number already registered' });
     const hash = await bcrypt.hash(password, 10);
     if (existing.rows.length) {
-      await pool.query('UPDATE users SET name=$1, phone=$2, password_hash=$3 WHERE email=$4', [name, phone, hash, email]);
+      await pool.query('UPDATE users SET name=$1, phone=$2, password_hash=$3, phone_verified=FALSE, email_verified=FALSE WHERE email=$4', [name, phone, hash, email]);
     } else {
-      await pool.query('INSERT INTO users (name, email, phone, password_hash) VALUES ($1,$2,$3,$4)', [name, email, phone, hash]);
+      await pool.query('INSERT INTO users (name, email, phone, password_hash, phone_verified, email_verified) VALUES ($1,$2,$3,$4,FALSE,FALSE)', [name, email, phone, hash]);
     }
-    // Send phone OTP
-    const otp = generateOTP();
+    // Send email OTP instead of phone OTP
+    const emailOtp = generateOTP();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-    await pool.query('DELETE FROM otps WHERE email=$1 AND type=$2', [email, 'phone']);
-    await pool.query('INSERT INTO otps (email, otp, expires_at, type) VALUES ($1,$2,$3,$4)', [email, otp, expiresAt, 'phone']);
-    await sendSMSOTP(phone, otp, name);
-    res.json({ message: 'Phone OTP sent' });
+    await pool.query('DELETE FROM otps WHERE email=$1 AND type=$2', [email, 'email']);
+    await pool.query('INSERT INTO otps (email, otp, expires_at, type) VALUES ($1,$2,$3,$4)', [email, emailOtp, expiresAt, 'email']);
+    await sendOTPEmail(email, emailOtp, name);
+    res.json({ message: 'Email OTP sent' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Server error' });
@@ -117,6 +117,7 @@ router.post('/verify-phone-otp', async (req, res) => {
     );
     if (!result.rows.length) return res.status(400).json({ error: 'Invalid or expired phone OTP' });
     await pool.query('DELETE FROM otps WHERE email=$1 AND type=$2', [email, 'phone']);
+    await pool.query('UPDATE users SET phone_verified=TRUE WHERE email=$1', [email]);
     // Send email OTP
     const user = await pool.query('SELECT name FROM users WHERE email=$1', [email]);
     const name = user.rows[0]?.name || '';
@@ -137,12 +138,16 @@ router.post('/verify-otp', async (req, res) => {
   const { email, otp } = req.body;
   if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
   try {
+    // Phone verification is no longer required as a prerequisite
+    const userCheck = await pool.query('SELECT phone_verified FROM users WHERE email=$1', [email]);
+    if (!userCheck.rows.length) return res.status(400).json({ error: 'Account not found' });
+
     const result = await pool.query(
       "SELECT * FROM otps WHERE email=$1 AND otp=$2 AND type='email' AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
       [email, otp]
     );
     if (!result.rows.length) return res.status(400).json({ error: 'Invalid or expired email OTP' });
-    await pool.query('UPDATE users SET is_verified=TRUE WHERE email=$1', [email]);
+    await pool.query('UPDATE users SET is_verified=TRUE, email_verified=TRUE WHERE email=$1', [email]);
     await pool.query('DELETE FROM otps WHERE email=$1', [email]);
     const user = await pool.query('SELECT id, name, email, phone, role FROM users WHERE email=$1', [email]);
     const u = user.rows[0];
@@ -160,7 +165,14 @@ router.post('/login', async (req, res) => {
     const result = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
     if (!result.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
     const user = result.rows[0];
-    if (!user.is_verified) return res.status(403).json({ error: 'Please verify your email first' });
+    if (!user.is_verified) {
+      const msg = !user.phone_verified
+        ? 'Please verify your phone number to continue'
+        : !user.email_verified
+        ? 'Please verify your email address to continue'
+        : 'Please complete account verification';
+      return res.status(403).json({ error: msg });
+    }
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
     const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
@@ -286,9 +298,32 @@ router.delete('/address/:id', authMiddleware, async (req, res) => {
 
 // POST /api/auth/orders
 router.post('/orders', authMiddleware, async (req, res) => {
-  const { items, address, total, coupon_code, payment_method, order_type, stripe_payment_intent_id } = req.body;
+  const { items, address, total, coupon_code, payment_method, order_type, stripe_payment_intent_id, discount_amount, shipping_fee, tax_amount } = req.body;
   if (!items || items.length === 0) return res.status(400).json({ error: 'Cart is empty' });
   try {
+    // Stock validation
+    for (const item of items) {
+      if (!item.product?.id) continue;
+      const prodRes = await pool.query('SELECT name, variants FROM products WHERE id=$1', [item.product.id]);
+      if (!prodRes.rows.length) return res.status(400).json({ error: `Product not found` });
+      let variants = [];
+      try { variants = typeof prodRes.rows[0].variants === 'string' ? JSON.parse(prodRes.rows[0].variants) : (prodRes.rows[0].variants || []); } catch(e) {}
+      const itemColor = (item.variant?.color || item.product?.color || '').toString().toLowerCase().trim();
+      const itemSize = (item.variant?.size || '').toString().trim();
+      for (const v of variants) {
+        const colorMatch = !itemColor || !v.color || v.color.toLowerCase().trim() === itemColor;
+        if (colorMatch) {
+          for (const s of (v.sizes || [])) {
+            if (!itemSize || s.size?.toString().trim() === itemSize) {
+              if (parseInt(s.stock || 0) < parseInt(item.qty || 1)) {
+                return res.status(400).json({ error: `"${prodRes.rows[0].name}" is out of stock or insufficient quantity available.`, outOfStock: true });
+              }
+            }
+          }
+        }
+      }
+    }
+
     const countRes = await pool.query('SELECT COUNT(*) FROM orders');
     const nextNum = parseInt(countRes.rows[0].count) + 1;
     const orderNumber = `HJ-${String(nextNum).padStart(6, '0')}`;
@@ -299,9 +334,9 @@ router.post('/orders', authMiddleware, async (req, res) => {
     const oType = order_type === 'pickup' ? 'pickup' : 'shipping';
 
     const result = await pool.query(
-      `INSERT INTO orders (user_id, order_number, total, items, address, status, payment_method, advance_paid, order_type, stripe_payment_intent_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-      [req.user.id, orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, stripe_payment_intent_id || null]
+      `INSERT INTO orders (user_id, order_number, total, items, address, status, payment_method, advance_paid, order_type, stripe_payment_intent_id, discount_amount, coupon_code, shipping_fee, tax_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+      [req.user.id, orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, stripe_payment_intent_id || null, discount_amount || 0, coupon_code || null, shipping_fee || 0, tax_amount || 0]
     );
 
     // Reduce stock
