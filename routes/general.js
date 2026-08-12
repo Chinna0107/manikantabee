@@ -82,32 +82,52 @@ router.post('/check-stock', async (req, res) => {
   try {
     const unavailable = [];
     for (const item of items) {
-      if (!item.product?.id) continue;
-      const prodRes = await pool.query('SELECT name, variants FROM products WHERE id=$1', [item.product.id]);
-      if (!prodRes.rows.length) { unavailable.push({ name: item.product.name || 'Unknown', reason: 'Product not found' }); continue; }
+      const productId = item.product?.id || item.id;
+      if (!productId) continue;
+      const prodRes = await pool.query('SELECT name, variants, stock FROM products WHERE id=$1', [productId]);
+      if (!prodRes.rows.length) { unavailable.push({ name: item.product?.name || item.name || 'Unknown', reason: 'Product not found', available: 0, requested: item.qty || 1 }); continue; }
+      
+      const prodName = prodRes.rows[0].name;
+      const prodStock = parseInt(prodRes.rows[0].stock || 0);
       let variants = [];
       try { variants = typeof prodRes.rows[0].variants === 'string' ? JSON.parse(prodRes.rows[0].variants) : (prodRes.rows[0].variants || []); } catch(e) {}
-      const itemColor = (item.variant?.color || item.product?.color || '').toString().toLowerCase().trim();
-      const itemSize = (item.variant?.size || '').toString().trim();
+      
+      const itemColor = (item.variant?.color || item.product?.color || item.color || '').toString().toLowerCase().trim();
+      const itemSize = (item.variant?.size || item.size || '').toString().trim();
       let found = false;
-      for (const v of variants) {
-        const vColor = (v.color || '').toString().toLowerCase().trim();
-        const colorMatch = !itemColor || !vColor || vColor === itemColor;
-        if (colorMatch) {
-          for (const s of (v.sizes || [])) {
-            if (!itemSize || s.size?.toString().trim() === itemSize) {
-              found = true;
-              if (parseInt(s.stock || 0) < parseInt(item.qty || 1)) {
-                unavailable.push({ name: prodRes.rows[0].name, available: parseInt(s.stock || 0), requested: item.qty });
+      let matchedStock = 0;
+
+      if (Array.isArray(variants) && variants.length > 0) {
+        for (const v of variants) {
+          const vColor = (v.color || '').toString().toLowerCase().trim();
+          const colorMatch = !itemColor || !vColor || vColor === itemColor;
+          if (colorMatch) {
+            for (const s of (v.sizes || [])) {
+              if (!itemSize || s.size?.toString().trim() === itemSize) {
+                found = true;
+                matchedStock = parseInt(s.stock ?? 0);
+                if (matchedStock < parseInt(item.qty || 1)) {
+                  unavailable.push({ name: prodName, available: matchedStock, requested: item.qty || 1 });
+                }
+                break;
               }
             }
           }
+          if (found) break;
         }
       }
-      if (!found) unavailable.push({ name: prodRes.rows[0].name, reason: 'Variant not found' });
+
+      if (!found) {
+        // Fallback to product-level stock if no variant matched or variants array was empty
+        matchedStock = prodStock;
+        if (matchedStock < parseInt(item.qty || 1)) {
+          unavailable.push({ name: prodName, available: matchedStock, requested: item.qty || 1 });
+        }
+      }
     }
     res.json({ available: unavailable.length === 0, unavailable });
   } catch (err) {
+    console.error('Error in check-stock:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });

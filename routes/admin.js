@@ -714,7 +714,7 @@ router.get('/products', authMiddleware, adminOnly, async (req, res) => {
 });
 
 router.post('/products', authMiddleware, adminOnly, async (req, res) => {
-    const { name, description, stock, sizes, image_url, images, color, category, model, is_active, is_bestseller, is_trending, is_offer, is_festive, variants, reviews, details, allow_reviews } = req.body;
+    const { name, description, stock, sizes, image_url, images, color, category, model, is_active, is_bestseller, is_trending, is_offer, is_festive, variants, reviews, details, allow_reviews, instagram_reel_url } = req.body;
     
     if ((!sizes || !Array.isArray(sizes) || sizes.length === 0) && (!variants || !Array.isArray(variants) || variants.length === 0)) {
       return res.status(400).json({ error: 'At least one size or variant with price is required.' });
@@ -745,8 +745,8 @@ router.post('/products', authMiddleware, adminOnly, async (req, res) => {
       }
     const result = await pool.query(
       `INSERT INTO products 
-       (name, description, stock, sizes, image_url, images, color, category, model, is_active, is_bestseller, is_trending, is_offer, is_festive, variants, reviews, details, allow_reviews) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) RETURNING *`,
+       (name, description, stock, sizes, image_url, images, color, category, model, is_active, is_bestseller, is_trending, is_offer, is_festive, variants, reviews, details, allow_reviews, instagram_reel_url) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING *`,
       [
         name, description, stock, JSON.stringify(sizes || []), image_url, 
         JSON.stringify(images || []), color, category, model, 
@@ -758,7 +758,8 @@ router.post('/products', authMiddleware, adminOnly, async (req, res) => {
         JSON.stringify(variants || []),
         JSON.stringify(reviews || []),
         JSON.stringify(details || []),
-        allow_reviews ?? true
+        allow_reviews ?? true,
+        instagram_reel_url || null
       ]
     );
     res.json({ product: result.rows[0] });
@@ -768,7 +769,7 @@ router.post('/products', authMiddleware, adminOnly, async (req, res) => {
 });
 
 router.put('/products/:id', authMiddleware, adminOnly, async (req, res) => {
-  const { name, description, sizes, stock, image_url, images, color, category, model, is_active, is_bestseller, is_trending, is_offer, is_festive, variants, reviews, details, allow_reviews } = req.body;
+  const { name, description, sizes, stock, image_url, images, color, category, model, is_active, is_bestseller, is_trending, is_offer, is_festive, variants, reviews, details, allow_reviews, instagram_reel_url } = req.body;
   try {
     if (variants && variants.length > 0) {
       const allProdsRes = await pool.query('SELECT id, variants FROM products WHERE id != $1', [req.params.id]);
@@ -825,8 +826,8 @@ router.put('/products/:id', authMiddleware, adminOnly, async (req, res) => {
     const reviewsJson = Array.isArray(reviews) ? JSON.stringify(reviews) : '[]';
     const detailsJson = Array.isArray(details) ? JSON.stringify(details) : '[]';
     const result = await pool.query(
-      'UPDATE products SET name=$1, description=$2, sizes=$3, stock=$4, image_url=$5, images=$6, color=$7, category=$8, model=$9, is_active=$10, is_bestseller=$11, is_trending=$12, is_offer=$13, is_festive=$14, variants=$15, reviews=$16, details=$17, allow_reviews=$18 WHERE id=$19 RETURNING *',
-      [name, description, sizesJson, stock, image_url, imagesJson, color, category, model || null, is_active, is_bestseller, is_trending, is_offer, is_festive, variantsJson, reviewsJson, detailsJson, allow_reviews ?? true, req.params.id]
+      'UPDATE products SET name=$1, description=$2, sizes=$3, stock=$4, image_url=$5, images=$6, color=$7, category=$8, model=$9, is_active=$10, is_bestseller=$11, is_trending=$12, is_offer=$13, is_festive=$14, variants=$15, reviews=$16, details=$17, allow_reviews=$18, instagram_reel_url=$19 WHERE id=$20 RETURNING *',
+      [name, description, sizesJson, stock, image_url, imagesJson, color, category, model || null, is_active, is_bestseller, is_trending, is_offer, is_festive, variantsJson, reviewsJson, detailsJson, allow_reviews ?? true, instagram_reel_url || null, req.params.id]
     );
     res.json({ product: result.rows[0] });
   } catch (err) {
@@ -1158,12 +1159,12 @@ router.get('/reviews', authMiddleware, adminOnly, async (req, res) => {
 
 // POST /api/admin/reviews
 router.post('/reviews', authMiddleware, adminOnly, async (req, res) => {
-  const { name, rating, review, is_active } = req.body;
+  const { name, rating, review, image_url, is_active } = req.body;
   if (!name || !review) return res.status(400).json({ error: 'Name and review are required' });
   try {
     const result = await pool.query(
-      'INSERT INTO reviews (name, rating, review, is_active) VALUES ($1, $2, $3, $4) RETURNING *',
-      [name, rating || 5, review, is_active ?? true]
+      'INSERT INTO reviews (name, rating, review, image_url, is_active) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [name, rating || 5, review, image_url || null, is_active ?? true]
     );
     res.json({ review: result.rows[0] });
   } catch (err) {
@@ -1173,11 +1174,11 @@ router.post('/reviews', authMiddleware, adminOnly, async (req, res) => {
 
 // PUT /api/admin/reviews/:id
 router.put('/reviews/:id', authMiddleware, adminOnly, async (req, res) => {
-  const { name, rating, review, is_active } = req.body;
+  const { name, rating, review, image_url, is_active } = req.body;
   try {
     const result = await pool.query(
-      'UPDATE reviews SET name=$1, rating=$2, review=$3, is_active=$4 WHERE id=$5 RETURNING *',
-      [name, rating || 5, review, is_active ?? true, req.params.id]
+      'UPDATE reviews SET name=$1, rating=$2, review=$3, image_url=$4, is_active=$5 WHERE id=$6 RETURNING *',
+      [name, rating || 5, review, image_url || null, is_active ?? true, req.params.id]
     );
     res.json({ review: result.rows[0] });
   } catch (err) {
