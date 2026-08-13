@@ -16,8 +16,8 @@ async function sendOrderEmailToAdmin(orderNumber, total, address, items) {
       </tr>`
     ).join('');
     await transporter.sendMail({
-      from: `"Houra Jewels" <${process.env.EMAIL_USER}>`,
-      to: 'support@hourajewels.com',
+      from: `"Manikanta Super Market" <${process.env.EMAIL_USER}>`,
+      to: 'support@manikantasupermarket.com',
       subject: `New Order Received - ${orderNumber}`,
       html: `
         <div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;padding:24px;border:1px solid #f0e0c0;border-radius:12px">
@@ -93,14 +93,14 @@ async function sendRefundEmail({ order, refundId, refundAmount, cancelType, canc
         </table>` : ''}
         ${refundSection}
         ${remainingSection}
-        <p style="margin-top:16px;color:#6b7280;font-size:12px">If you have questions, contact us at support@hourajewels.com</p>
+        <p style="margin-top:16px;color:#6b7280;font-size:12px">If you have questions, contact us at support@manikantasupermarket.com</p>
       </div>`;
 
     const promises = [];
     // Email to customer
     if (customerEmail) {
       promises.push(transporter.sendMail({
-        from: `"Houra Jewels" <${process.env.EMAIL_USER}>`,
+        from: `"Manikanta Super Market" <${process.env.EMAIL_USER}>`,
         to: customerEmail,
         subject: `Order ${isNoRefund ? 'Cancelled' : 'Cancellation & Refund'} — #${orderNum}`,
         html,
@@ -108,8 +108,8 @@ async function sendRefundEmail({ order, refundId, refundAmount, cancelType, canc
     }
     // Email to admin
     promises.push(transporter.sendMail({
-      from: `"Houra Jewels" <${process.env.EMAIL_USER}>`,
-      to: 'support@hourajewels.com',
+      from: `"Manikanta Super Market" <${process.env.EMAIL_USER}>`,
+      to: 'support@manikantasupermarket.com',
       subject: `[Admin] Order ${isNoRefund ? 'Cancelled (No Refund)' : 'Refund Issued'} — #${orderNum}`,
       html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;padding:24px">
         <h2 style="color:#08183A">${isNoRefund ? 'Order Cancelled (No Refund)' : 'Refund Issued'} — #${orderNum}</h2>

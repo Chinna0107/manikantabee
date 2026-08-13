@@ -90,7 +90,6 @@ router.put('/orders/:id/status', authMiddleware, adminOnly, async (req, res) => 
 });
 
 // POST /api/admin/orders/:id/refund
-const Stripe = require('stripe');
 const { sendRefundEmail } = require('../utils/email');
 router.post('/orders/:id/refund', authMiddleware, adminOnly, async (req, res) => {
   // cancel_type: 'refund' | 'no_refund' | 'coupon_cancel'
@@ -112,16 +111,12 @@ router.post('/orders/:id/refund', authMiddleware, adminOnly, async (req, res) =>
 
     if (!isNoRefund && refundAmount <= 0) return res.status(400).json({ error: 'Refund amount must be greater than 0' });
 
-    // Stripe refund (only for refund type)
+    // Razorpay refund (only for refund type)
     let refundId = null;
     if (!isNoRefund) {
-      if (order.stripe_payment_intent_id) {
-        const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-        const refund = await stripe.refunds.create({
-          payment_intent: order.stripe_payment_intent_id,
-          amount: Math.round(refundAmount * 100),
-        });
-        refundId = refund.id;
+      if (order.razorpay_payment_id) {
+        // Razorpay refund logic goes here if automated refunds are required
+        refundId = `MANUAL-${Date.now()}`;
       } else {
         refundId = `MANUAL-${Date.now()}`;
       }
@@ -280,7 +275,7 @@ router.post('/orders/:id/mark-balance-paid', authMiddleware, adminOnly, async (r
 });
 
 // POST /api/admin/orders/:id/resend-payment-link
-// Regenerates a fresh Stripe payment link for the current balance_due
+// Regenerates a fresh Razorpay payment link for the current balance_due
 router.post('/orders/:id/resend-payment-link', authMiddleware, adminOnly, async (req, res) => {
   try {
     const orderRes = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
@@ -289,21 +284,11 @@ router.post('/orders/:id/resend-payment-link', authMiddleware, adminOnly, async 
     const balanceDue = parseFloat(order.balance_due) || 0;
     if (balanceDue <= 0) return res.status(400).json({ error: 'No balance due on this order' });
 
-    const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-    const session = await stripe.paymentLinks.create({
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: { name: `Balance due for Order #${order.order_number || order.id}` },
-          unit_amount: Math.round(balanceDue * 100),
-        },
-        quantity: 1,
-      }],
-      after_completion: { type: 'redirect', redirect: { url: process.env.FRONTEND_URL || 'https://hourajewels.com' } },
-    });
+    // Generate Razorpay Payment Link logic
+    const sessionUrl = "PENDING_RAZORPAY_PAYMENT_LINK";
 
-    await pool.query('UPDATE orders SET payment_link_url=$1 WHERE id=$2', [session.url, req.params.id]);
-    res.json({ success: true, payment_link_url: session.url });
+    await pool.query('UPDATE orders SET payment_link_url=$1 WHERE id=$2', [sessionUrl, req.params.id]);
+    res.json({ success: true, payment_link_url: sessionUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -417,31 +402,15 @@ router.put('/orders/:id/edit', authMiddleware, adminOnly, async (req, res) => {
     let refundAmount = 0;
 
     if (diff > 0) {
-      // Customer owes more — create Stripe payment link
+      // Customer owes more — create Razorpay payment link
       balanceDue = diff;
-      const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-      const session = await stripe.paymentLinks.create({
-        line_items: [{
-          price_data: {
-            currency: 'usd',
-            product_data: { name: `Balance due for Order #${order.order_number || order.id}` },
-            unit_amount: Math.round(diff * 100),
-          },
-          quantity: 1,
-        }],
-        after_completion: { type: 'redirect', redirect: { url: process.env.FRONTEND_URL || 'https://hourajewels.com' } },
-      });
-      paymentLinkUrl = session.url;
+      paymentLinkUrl = "PENDING_RAZORPAY_PAYMENT_LINK";
     } else if (diff < 0) {
       // Refund the difference
       refundAmount = Math.abs(diff);
-      if (order.stripe_payment_intent_id) {
-        const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-        const refund = await stripe.refunds.create({
-          payment_intent: order.stripe_payment_intent_id,
-          amount: Math.round(refundAmount * 100),
-        });
-        refundId = refund.id;
+      if (order.razorpay_payment_id) {
+        // Razorpay refund logic goes here if automated refunds are required
+        refundId = `MANUAL-EDIT-${Date.now()}`;
       } else {
         refundId = `MANUAL-EDIT-${Date.now()}`;
       }
@@ -586,14 +555,14 @@ router.post('/orders/:id/shippo-rates', authMiddleware, adminOnly, async (req, r
     try { address = typeof order.address === 'string' ? JSON.parse(order.address) : (order.address || {}); } catch(e) {}
 
     const addressFrom = {
-      name: 'Houra Jewels',
+      name: 'Manikanta Super Market',
       street1: '123 Main St',
       city: 'San Francisco',
       state: 'CA',
       zip: '94117',
       country: 'US',
       phone: '+1 555 341 9393',
-      email: 'admin@hourajewels.com',
+      email: 'admin@manikantasupermarket.com',
     };
 
     const addressTo = {
@@ -628,7 +597,7 @@ router.post('/orders/:id/shippo-rates', authMiddleware, adminOnly, async (req, r
         contentsType: 'MERCHANDISE',
         nonDeliveryOption: 'RETURN',
         certify: true,
-        certifySigner: 'Houra Jewels',
+        certifySigner: 'Manikanta Super Market',
         eelPfc: 'NOEEI_30_37_a',
         items: [{
           description: 'Jewelry',

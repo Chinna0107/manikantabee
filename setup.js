@@ -2,6 +2,9 @@ const pool = require('./db');
 
 async function setup() {
   await pool.query(`
+    CREATE SCHEMA IF NOT EXISTS public;
+    SET search_path TO public;
+
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       name VARCHAR(150),
@@ -135,14 +138,14 @@ async function setup() {
 
   // Seed admin user
   const bcrypt = require('bcryptjs');
-  const adminEmail = 'admin@houra.com';
+  const adminEmail = 'admin@manikanta.com';
   const adminPass = await bcrypt.hash('Admin@1234', 10);
   await pool.query(`
     INSERT INTO users (name, email, phone, password_hash, is_verified, role)
     VALUES ('Admin', $1, '+91 00000 00000', $2, TRUE, 'admin')
     ON CONFLICT (email) DO UPDATE SET role='admin', is_verified=TRUE, password_hash=$2
   `, [adminEmail, adminPass]);
-  console.log('✅ Admin seeded → email: admin@houra.com | password: Admin@1234');
+  console.log('✅ Admin seeded → email: admin@manikanta.com | password: Admin@1234');
   process.exit(0);
 }
 

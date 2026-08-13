@@ -20,12 +20,12 @@ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 async function sendOTPEmail(email, otp, name) {
   await transporter.sendMail({
-    from: `"Houra Jewels" <${process.env.EMAIL_USER}>`,
+    from: `"Manikanta Super Market" <${process.env.EMAIL_USER}>`,
     to: email,
-    subject: 'Your OTP for Houra Jewels Signup',
+    subject: 'Your OTP for Manikanta Super Market Signup',
     html: `
       <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #f0e0c0;border-radius:12px;">
-        <h2 style="color:#b45309;">Welcome to Houra Jewels</h2>
+        <h2 style="color:#b45309;">Welcome to Manikanta Super Market</h2>
         <p>Hi <strong>${name}</strong>,</p>
         <p>Your OTP for account verification is:</p>
         <div style="font-size:36px;font-weight:bold;color:#ea580c;letter-spacing:8px;text-align:center;padding:16px;background:#fff7ed;border-radius:8px;margin:16px 0;">
@@ -52,7 +52,7 @@ async function sendSMSOTP(phone, otp, name) {
 
   try {
     await twilioClient.messages.create({
-      body: `Your Houra Jewels OTP is ${otp}. Valid for 10 minutes.`,
+      body: `Your Manikanta Super Market OTP is ${otp}. Valid for 10 minutes.`,
       from: process.env.TWILIO_PHONE_NUMBER,
       to: formattedPhone
     });
@@ -77,7 +77,8 @@ function authMiddleware(req, res, next) {
 // POST /api/auth/signup
 // POST /api/auth/signup — Step 0: save user data, send phone OTP
 router.post('/signup', async (req, res) => {
-  const { name, email, phone, password } = req.body;
+  const { name, email, phone, password, role } = req.body;
+  const userRole = (role === 'shopkeeper') ? 'shopkeeper' : 'user';
   if (!name || !email || !phone || !password)
     return res.status(400).json({ error: 'All fields are required' });
   try {
@@ -89,9 +90,9 @@ router.post('/signup', async (req, res) => {
       return res.status(409).json({ error: 'Phone number already registered' });
     const hash = await bcrypt.hash(password, 10);
     if (existing.rows.length) {
-      await pool.query('UPDATE users SET name=$1, phone=$2, password_hash=$3, phone_verified=FALSE, email_verified=FALSE WHERE email=$4', [name, phone, hash, email]);
+      await pool.query('UPDATE users SET name=$1, phone=$2, password_hash=$3, role=$5, phone_verified=FALSE, email_verified=FALSE WHERE email=$4', [name, phone, hash, email, userRole]);
     } else {
-      await pool.query('INSERT INTO users (name, email, phone, password_hash, phone_verified, email_verified) VALUES ($1,$2,$3,$4,FALSE,FALSE)', [name, email, phone, hash]);
+      await pool.query('INSERT INTO users (name, email, phone, password_hash, role, phone_verified, email_verified) VALUES ($1,$2,$3,$4,$5,FALSE,FALSE)', [name, email, phone, hash, userRole]);
     }
     // Send email OTP instead of phone OTP
     const emailOtp = generateOTP();
@@ -220,7 +221,7 @@ router.post('/google', async (req, res) => {
 // GET /api/auth/profile
 router.get('/profile', authMiddleware, async (req, res) => {
   try {
-    const user = await pool.query('SELECT id, name, email, phone, avatar_url, created_at FROM users WHERE id=$1', [req.user.id]);
+    const user = await pool.query('SELECT id, name, email, phone, role, avatar_url, created_at FROM users WHERE id=$1', [req.user.id]);
     const addresses = await pool.query('SELECT * FROM addresses WHERE user_id=$1 ORDER BY is_default DESC', [req.user.id]);
     const orders = await pool.query('SELECT * FROM orders WHERE user_id=$1 ORDER BY created_at DESC', [req.user.id]);
     res.json({ user: user.rows[0], addresses: addresses.rows, orders: orders.rows });
@@ -298,7 +299,7 @@ router.delete('/address/:id', authMiddleware, async (req, res) => {
 
 // POST /api/auth/orders
 router.post('/orders', authMiddleware, async (req, res) => {
-  const { items, address, total, coupon_code, payment_method, order_type, stripe_payment_intent_id, discount_amount, shipping_fee, tax_amount } = req.body;
+  const { items, address, total, coupon_code, payment_method, order_type, razorpay_order_id, razorpay_payment_id, razorpay_signature, discount_amount, shipping_fee, tax_amount } = req.body;
   if (!items || items.length === 0) return res.status(400).json({ error: 'Cart is empty' });
   try {
     // Stock validation
@@ -326,17 +327,17 @@ router.post('/orders', authMiddleware, async (req, res) => {
 
     const countRes = await pool.query('SELECT COUNT(*) FROM orders');
     const nextNum = parseInt(countRes.rows[0].count) + 1;
-    const orderNumber = `HJ-${String(nextNum).padStart(6, '0')}`;
+    const orderNumber = `MSM-${String(nextNum).padStart(6, '0')}`;
     const itemsJson = JSON.stringify(items);
     const addressJson = JSON.stringify(address || {});
     const pMethod = payment_method || 'prepaid';
     const advancePaid = pMethod === 'cod' ? 100 : (parseFloat(total) || 0);
-    const oType = order_type === 'pickup' ? 'pickup' : 'shipping';
+    const oType = (order_type === 'pickup' || order_type === 'direct') ? order_type : 'shipping';
 
     const result = await pool.query(
-      `INSERT INTO orders (user_id, order_number, total, items, address, status, payment_method, advance_paid, order_type, stripe_payment_intent_id, discount_amount, coupon_code, shipping_fee, tax_amount)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
-      [req.user.id, orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, stripe_payment_intent_id || null, discount_amount || 0, coupon_code || null, shipping_fee || 0, tax_amount || 0]
+      `INSERT INTO orders (user_id, order_number, total, items, address, status, payment_method, advance_paid, order_type, razorpay_order_id, razorpay_payment_id, razorpay_signature, discount_amount, coupon_code, shipping_fee, tax_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *`,
+      [req.user.id, orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, razorpay_order_id || null, razorpay_payment_id || null, razorpay_signature || null, discount_amount || 0, coupon_code || null, shipping_fee || 0, tax_amount || 0]
     );
 
     // Reduce stock
@@ -440,9 +441,9 @@ router.post('/forgot-password', async (req, res) => {
     await pool.query('DELETE FROM otps WHERE email=$1', [email]);
     await pool.query('INSERT INTO otps (email, otp, expires_at) VALUES ($1,$2,$3)', [email, otp, expiresAt]);
     await transporter.sendMail({
-      from: `"Houra Jewels" <${process.env.EMAIL_USER}>`,
+      from: `"Manikanta Super Market" <${process.env.EMAIL_USER}>`,
       to: email,
-      subject: 'Reset Your Houra Jewels Password',
+      subject: 'Reset Your Manikanta Super Market Password',
       html: `
         <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #f0e0c0;border-radius:12px;">
           <h2 style="color:#b45309;">🔐 Password Reset</h2>

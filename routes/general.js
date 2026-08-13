@@ -1,7 +1,11 @@
 const router = require('express').Router();
 const pool = require('../db');
-const Stripe = require('stripe');
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_dummy',
+  key_secret: process.env.RAZORPAY_KEY_SECRET || 'dummy_secret'
+});
 const { sendOrderEmailToAdmin } = require('../utils/email');
 
 // GET /api/general/db-test
@@ -134,7 +138,7 @@ router.post('/check-stock', async (req, res) => {
 
 // POST /api/general/orders (Checkout)
 router.post('/orders', async (req, res) => {
-  const { items, address, total, coupon_code, payment_method, advance_paid, order_type, stripe_payment_intent_id, discount_amount, shipping_fee, tax_amount } = req.body;
+  const { items, address, total, coupon_code, payment_method, advance_paid, order_type, razorpay_order_id, razorpay_payment_id, razorpay_signature, discount_amount, shipping_fee, tax_amount } = req.body;
   
   if (!items || items.length === 0) {
     return res.status(400).json({ error: 'Cart is empty' });
@@ -166,17 +170,17 @@ router.post('/orders', async (req, res) => {
 
     const countRes = await pool.query(`SELECT COUNT(*) FROM orders`);
     const nextNum = parseInt(countRes.rows[0].count) + 1;
-    const orderNumber = `HJ-${String(nextNum).padStart(6, '0')}`;
+    const orderNumber = `MSM-${String(nextNum).padStart(6, '0')}`;
     const itemsJson = JSON.stringify(items);
     const addressJson = JSON.stringify(address || {});
     const pMethod = payment_method || 'prepaid';
     const advancePaid = pMethod === 'cod' ? 100 : (parseFloat(total) || 0);
-    const oType = order_type === 'pickup' ? 'pickup' : 'shipping';
+    const oType = (order_type === 'pickup' || order_type === 'direct') ? order_type : 'shipping';
     
     const result = await pool.query(
-      `INSERT INTO orders (order_number, total, items, address, status, payment_method, advance_paid, order_type, stripe_payment_intent_id, discount_amount, coupon_code, shipping_fee, tax_amount)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
-      [orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, stripe_payment_intent_id || null, discount_amount || 0, coupon_code || null, shipping_fee || 0, tax_amount || 0]
+      `INSERT INTO orders (order_number, total, items, address, status, payment_method, advance_paid, order_type, razorpay_order_id, razorpay_payment_id, razorpay_signature, discount_amount, coupon_code, shipping_fee, tax_amount)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *`,
+      [orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, razorpay_order_id || null, razorpay_payment_id || null, razorpay_signature || null, discount_amount || 0, coupon_code || null, shipping_fee || 0, tax_amount || 0]
     );
     
     // Reduce Stock Logic
@@ -232,36 +236,46 @@ router.post('/orders', async (req, res) => {
   }
 });
 
-// POST /api/general/stripe/create-payment-intent
-router.post('/stripe/create-payment-intent', async (req, res) => {
+// POST /api/general/razorpay/create-order
+router.post('/razorpay/create-order', async (req, res) => {
   const { amount } = req.body;
   if (!amount) return res.status(400).json({ error: 'Amount is required' });
   try {
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(amount * 100), // cents
-      currency: 'usd',
-      automatic_payment_methods: { enabled: true },
-    });
-    res.json({ success: true, clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+    const options = {
+      amount: Math.round(amount * 100), // paise
+      currency: 'INR',
+      receipt: `rcpt_${Date.now()}`
+    };
+    const order = await razorpay.orders.create(options);
+    res.json({ success: true, orderId: order.id, amount: order.amount });
   } catch (err) {
-    console.error('Stripe error:', err);
+    console.error('Razorpay create order error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/general/stripe/verify
-router.post('/stripe/verify', async (req, res) => {
-  const { paymentIntentId } = req.body;
-  if (!paymentIntentId) return res.status(400).json({ error: 'paymentIntentId required' });
+// POST /api/general/razorpay/verify
+router.post('/razorpay/verify', async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+  
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ error: 'Missing Razorpay parameters' });
+  }
+
   try {
-    const intent = await stripe.paymentIntents.retrieve(paymentIntentId);
-    if (intent.status === 'succeeded') {
+    const body = razorpay_order_id + '|' + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || 'dummy_secret')
+      .update(body.toString())
+      .digest('hex');
+
+    if (expectedSignature === razorpay_signature) {
       res.json({ success: true });
     } else {
-      res.status(400).json({ error: `Payment not completed. Status: ${intent.status}` });
+      res.status(400).json({ error: 'Invalid signature' });
     }
   } catch (err) {
-    console.error('Stripe verify error:', err);
+    console.error('Razorpay verify error:', err);
     res.status(500).json({ error: err.message });
   }
 });

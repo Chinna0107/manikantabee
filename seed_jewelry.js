@@ -42,7 +42,7 @@ async function seedJewelry() {
         const adjective = adjectives[Math.floor(Math.random() * adjectives.length)];
         const catSingular = cat.endsWith('s') ? cat.slice(0, -1) : cat;
         const name = `${adjective} ${material} ${catSingular}`;
-        const description = `This is a beautifully crafted ${name}, perfect for adding a touch of elegance to your attire. Handcrafted by master artisans with precision and care, this piece is a testament to the luxurious heritage of Houra Jewels.`;
+        const description = `This is a beautifully crafted ${name}, perfect for adding a touch of elegance to your attire. Handcrafted by master artisans with precision and care, this piece is a testament to the luxurious heritage of Manikanta Super Market.`;
         
         const is_bestseller = Math.random() < 0.3;
         const is_trending = Math.random() < 0.3;
