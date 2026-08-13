@@ -7,8 +7,8 @@ const PORT = process.env.PORT || 5000;
 
 const allowedOrigins = [
   'http://localhost:5173',
-  'https://jewels-teal.vercel.app',
-  'https://jewels-teal.vercel.app/',
+  'https://manikanta-two.vercel.app',
+  
   process.env.FRONTEND_URL
 ].filter(Boolean);
 
