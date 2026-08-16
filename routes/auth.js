@@ -221,7 +221,7 @@ router.post('/google', async (req, res) => {
 // GET /api/auth/profile
 router.get('/profile', authMiddleware, async (req, res) => {
   try {
-    const user = await pool.query('SELECT id, name, email, phone, role, avatar_url, created_at FROM users WHERE id=$1', [req.user.id]);
+    const user = await pool.query('SELECT id, name, email, phone, role, avatar_url, created_at, m_coins FROM users WHERE id=$1', [req.user.id]);
     const addresses = await pool.query('SELECT * FROM addresses WHERE user_id=$1 ORDER BY is_default DESC', [req.user.id]);
     const orders = await pool.query('SELECT * FROM orders WHERE user_id=$1 ORDER BY created_at DESC', [req.user.id]);
     res.json({ user: user.rows[0], addresses: addresses.rows, orders: orders.rows });
@@ -339,6 +339,16 @@ router.post('/orders', authMiddleware, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *`,
       [req.user.id, orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, razorpay_order_id || null, razorpay_payment_id || null, razorpay_signature || null, discount_amount || 0, coupon_code || null, shipping_fee || 0, tax_amount || 0]
     );
+
+    // M Coins Logic
+    let mCoinsEarned = 0;
+    const orderTotal = parseFloat(total);
+    if (orderTotal > 1999) mCoinsEarned = 30;
+    else if (orderTotal > 999) mCoinsEarned = 15;
+    
+    if (mCoinsEarned > 0) {
+      await pool.query('UPDATE users SET m_coins = m_coins + $1 WHERE id = $2', [mCoinsEarned, req.user.id]);
+    }
 
     // Reduce stock
     for (const item of items) {

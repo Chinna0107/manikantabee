@@ -32,6 +32,7 @@ app.use('/api/general', require('./routes/general'));
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/admin/upload', require('./routes/upload'));
+app.use('/api/delivery', require('./routes/delivery'));
 
 app.use((req, res) => res.status(404).json({ error: 'API route not found' }));
 
