@@ -299,7 +299,7 @@ router.delete('/address/:id', authMiddleware, async (req, res) => {
 
 // POST /api/auth/orders
 router.post('/orders', authMiddleware, async (req, res) => {
-  const { items, address, total, coupon_code, payment_method, order_type, razorpay_order_id, razorpay_payment_id, razorpay_signature, discount_amount, shipping_fee, tax_amount } = req.body;
+  const { items, address, total, coupon_code, payment_method, order_type, razorpay_order_id, razorpay_payment_id, razorpay_signature, discount_amount, shipping_fee, tax_amount, m_coins_used } = req.body;
   if (!items || items.length === 0) return res.status(400).json({ error: 'Cart is empty' });
   try {
     // Stock validation
@@ -335,9 +335,9 @@ router.post('/orders', authMiddleware, async (req, res) => {
     const oType = (order_type === 'pickup' || order_type === 'direct') ? order_type : 'shipping';
 
     const result = await pool.query(
-      `INSERT INTO orders (user_id, order_number, total, items, address, status, payment_method, advance_paid, order_type, razorpay_order_id, razorpay_payment_id, razorpay_signature, discount_amount, coupon_code, shipping_fee, tax_amount)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *`,
-      [req.user.id, orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, razorpay_order_id || null, razorpay_payment_id || null, razorpay_signature || null, discount_amount || 0, coupon_code || null, shipping_fee || 0, tax_amount || 0]
+      `INSERT INTO orders (user_id, order_number, total, items, address, status, payment_method, advance_paid, order_type, razorpay_order_id, razorpay_payment_id, razorpay_signature, discount_amount, coupon_code, shipping_fee, tax_amount, m_coins_used)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`,
+      [req.user.id, orderNumber, total, itemsJson, addressJson, 'pending', pMethod, advancePaid, oType, razorpay_order_id || null, razorpay_payment_id || null, razorpay_signature || null, discount_amount || 0, coupon_code || null, shipping_fee || 0, tax_amount || 0, parseFloat(m_coins_used) || 0]
     );
 
     // M Coins Logic
@@ -346,8 +346,9 @@ router.post('/orders', authMiddleware, async (req, res) => {
     if (orderTotal > 1999) mCoinsEarned = 30;
     else if (orderTotal > 999) mCoinsEarned = 15;
     
-    if (mCoinsEarned > 0) {
-      await pool.query('UPDATE users SET m_coins = m_coins + $1 WHERE id = $2', [mCoinsEarned, req.user.id]);
+    if (mCoinsEarned > 0 || (parseFloat(m_coins_used) || 0) > 0) {
+      const coinsUsed = parseFloat(m_coins_used) || 0;
+      await pool.query('UPDATE users SET m_coins = GREATEST(m_coins + $1 - $2, 0) WHERE id = $3', [mCoinsEarned, coinsUsed, req.user.id]);
     }
 
     // Reduce stock
